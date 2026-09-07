@@ -635,14 +635,32 @@ async function pairWith(ctx, opts = {}) {
   // --new skips the adopt path, for when an existing thread is already messy.
   const existing = opts.fresh ? null : ledgerThreadFor(ctx.transcript);
   const existingRollout = existing && rolloutForThread(existing);
-  if (existingRollout) return { threadId: existing, rollout: existingRollout, title, adopted: true };
+  if (existingRollout) {
+    // A thread with a body already holds this conversation, however it got
+    // there. Writing it again is how you end up reading everything twice.
+    const hasBody = countLines(existingRollout) > 1;
+    return { threadId: existing, rollout: existingRollout, title, adopted: true, importCarriedBody: hasBody };
+  }
 
   const created = await importClaudeSession(ctx.cwd, ctx.transcript, title);
   const rollout = rolloutForThread(created.threadId);
   if (!rollout) throw new Error("Codex imported the session but wrote no file for it");
-  // The import carries plain messages only; relay appends the rest on top, so
-  // the head of the thread is skipped rather than written twice.
-  return { threadId: created.threadId, rollout, title, adopted: false, imported: true };
+
+  // The import writes the conversation as plain messages, and relay is about to
+  // write the same conversation with its tool calls and images. Keep the header
+  // Codex wrote and drop its body, or every turn appears twice. A thread this
+  // new has not been read yet, so there is nothing to disturb.
+  let importCarriedBody = true;
+  try {
+    const header = firstRecordOf(rollout);
+    if (header) {
+      writeRecords(rollout, [header], false);
+      importCarriedBody = false;
+    }
+  } catch {
+    // Codex still holds the file: leave its version alone and carry on from here.
+  }
+  return { threadId: created.threadId, rollout, title, adopted: false, importCarriedBody };
 }
 
 async function toCodex(ctx, opts) {
@@ -670,6 +688,10 @@ async function toCodex(ctx, opts) {
 
   const pair = prior ?? (await pairWith(ctx, opts));
   const { threadId, rollout, title } = pair;
+
+  // Codex already wrote this conversation and we could not clear it, so start
+  // from here rather than saying everything twice.
+  if (!prior && pair.importCarriedBody) fresh.length = 0;
   // A thread Codex has just created has a path and no file, so it needs the
   // header before anything else. An adopted thread already has one.
   if (!fs.existsSync(rollout)) {
