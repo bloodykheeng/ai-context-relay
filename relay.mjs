@@ -921,12 +921,57 @@ async function syncAll(opts) {
   return say;
 }
 
+// Claude writes a transcript line by line, so a single reply fires many change
+// events. Wait for it to go quiet rather than syncing on each one.
+const SETTLE_MS = 1500;
+
+// A pass can take minutes when it has to create a Codex thread, and file events
+// keep arriving while it does. One at a time, with the last request remembered.
+function passRunner(opts) {
+  let running = false;
+  let queued = false;
+
+  const run = async () => {
+    if (running) { queued = true; return; }
+    running = true;
+    try {
+      for (const line of await syncAll(opts)) console.log(`relay: ${line}`);
+    } catch (error) {
+      console.error(`relay: ${error.message}`);
+    } finally {
+      running = false;
+      if (queued) { queued = false; void run(); }
+    }
+  };
+  return run;
+}
+
 async function watch(opts) {
-  console.log(`relay: watching every project, checking every ${opts.interval}s. Ctrl+C to stop.`);
+  const runPass = passRunner(opts);
   // A watcher started before an update keeps running the old code for as long
   // as the machine stays on, which is how a fix can look like it did nothing.
   const ownFile = new URL(import.meta.url).pathname.slice(1);
   const startedWith = fs.statSync(ownFile).mtimeMs;
+
+  // React the moment Claude writes, rather than up to a whole interval later.
+  // The poll below stays as a safety net: directory watching on Windows drops
+  // events often enough that it cannot be the only trigger.
+  let settle = null;
+  let watching = false;
+  try {
+    fs.watch(CLAUDE_PROJECTS, { recursive: true }, (_event, name) => {
+      if (name && !String(name).endsWith(".jsonl")) return;
+      clearTimeout(settle);
+      settle = setTimeout(() => void runPass(), SETTLE_MS);
+    });
+    watching = true;
+  } catch {
+    // No notification support here; the poll alone still works.
+  }
+
+  console.log(watching
+    ? `relay: watching for changes, with a check every ${opts.interval}s as a backstop. Ctrl+C to stop.`
+    : `relay: checking every ${opts.interval}s. Ctrl+C to stop.`);
 
   for (;;) {
     if (fs.existsSync(ownFile) && fs.statSync(ownFile).mtimeMs !== startedWith) {
@@ -934,11 +979,7 @@ async function watch(opts) {
       spawn(process.execPath, [ownFile, ...process.argv.slice(2)], { detached: true, stdio: "ignore" }).unref();
       return;
     }
-    try {
-      for (const line of await syncAll(opts)) console.log(`relay: ${line}`);
-    } catch (error) {
-      console.error(`relay: ${error.message}`);
-    }
+    await runPass();
     await new Promise((r) => setTimeout(r, opts.interval * 1000));
   }
 }
