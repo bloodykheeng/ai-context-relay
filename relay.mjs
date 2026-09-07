@@ -1003,7 +1003,10 @@ async function watch(opts) {
     if (fs.existsSync(ownFile) && fs.statSync(ownFile).mtimeMs !== startedWith) {
       console.log("relay: updated on disk, restarting on the new version");
       spawn(process.execPath, [ownFile, ...process.argv.slice(2)], { detached: true, stdio: "ignore" }).unref();
-      return;
+      // Exit, do not just return: the file watcher holds the event loop open,
+      // so returning leaves this process alive and every update stacks another
+      // watcher on top of it, all syncing the same files against each other.
+      process.exit(0);
     }
     await runPass();
     await new Promise((r) => setTimeout(r, opts.interval * 1000));
