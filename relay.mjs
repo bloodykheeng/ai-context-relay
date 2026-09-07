@@ -784,6 +784,57 @@ function renderFromCodex(items) {
   return lines.join("\n");
 }
 
+// The mirror of pushing into a Codex rollout: append to the Claude transcript so
+// the work is simply there when the session is opened. Claude Code reads a
+// session from this file, so this is what makes the two sides symmetric.
+const synthetic = (text) => ({
+  id: crypto.randomUUID(), type: "message", role: "assistant", model: "<synthetic>",
+  stop_reason: "stop_sequence", stop_sequence: "",
+  content: [{ type: "text", text }],
+  usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+});
+
+function claudeRecords(items, ctx) {
+  const records = [];
+  let parent = ctx.parentUuid;
+  const push = (record) => {
+    record.uuid = crypto.randomUUID();
+    record.timestamp = stamp();
+    records.push(record);
+    parent = record.uuid;
+  };
+  const base = () => ({
+    parentUuid: parent, isSidechain: false, userType: "external", entrypoint: "relay",
+    cwd: ctx.cwd, sessionId: ctx.sessionId, version: ctx.version, gitBranch: ctx.gitBranch,
+    relayOrigin: "codex",
+  });
+  const say = (text) => push({ ...base(), type: "assistant", message: synthetic(text) });
+
+  for (const item of items) {
+    if (item.kind === "user") push({ ...base(), type: "user", message: { role: "user", content: label(FROM_CODEX, item.text) } });
+    else if (item.kind === "assistant") say(label(FROM_CODEX, item.text));
+    else if (item.kind === "tool_call") {
+      const args = typeof item.input === "string" ? item.input : JSON.stringify(item.input);
+      say(`${FROM_CODEX} ran ${item.name}\n${String(args).slice(0, 2000)}`);
+    } else if (item.kind === "tool_result" && item.text.trim()) {
+      say(`${FROM_CODEX} result\n${item.text.slice(0, 4000)}`);
+    }
+  }
+  return records;
+}
+
+function claudeContext(file) {
+  const records = readJsonl(file);
+  const anchor = [...records].reverse().find((r) => r.sessionId) ?? {};
+  return {
+    parentUuid: records[records.length - 1]?.uuid ?? null,
+    sessionId: anchor.sessionId ?? path.basename(file, ".jsonl"),
+    cwd: anchor.cwd ?? process.cwd(),
+    version: anchor.version ?? "2.1.263",
+    gitBranch: anchor.gitBranch ?? null,
+  };
+}
+
 function markCodexRead(ctx, marks) {
   const state = loadState();
   state.codexReads = { ...(state.codexReads ?? {}), ...marks };
@@ -922,6 +973,11 @@ const PAIR_WINDOW_MS = 30 * 60 * 1000;
 // in the conversation at once.
 const MAX_ITEMS_PULLED = 60;
 
+// Codex work is written into a Claude session only once you have left it. While
+// you are still typing, the hook delivers it live instead. Appending under a
+// session Claude Code is actively writing is what corrupts a turn.
+const LEFT_THE_SESSION_MS = 90 * 1000;
+
 const recentlyTouched = (file) => Date.now() - fs.statSync(file).mtimeMs < ACTIVE_WINDOW_MS;
 
 // Every transcript across every project that has been written to lately.
@@ -991,6 +1047,20 @@ async function syncAll(opts) {
       const ctx = { cwd: thread.cwd, transcript: key, key, state: loadState() };
       const up = await toCodex(ctx, opts);
       if (up.moved) say.push(`${path.basename(thread.cwd)}: sent ${up.moved} to Codex`);
+
+      // The other direction, written into the session so it is simply there when
+      // you open it. Only once you have left: appending under a session Claude
+      // Code is still writing lands records in the middle of a turn.
+      ctx.state = loadState();
+      const idleFor = Date.now() - fs.statSync(key).mtimeMs;
+      if (idleFor > LEFT_THE_SESSION_MS) {
+        const { items, marks } = pendingFromCodex(ctx);
+        if (items.length) {
+          writeRecords(key, claudeRecords(items, claudeContext(key)), true);
+          markCodexRead(ctx, marks);
+          say.push(`${path.basename(thread.cwd)}: brought ${items.length} back into Claude`);
+        }
+      }
       rememberMtimes(key);
     } catch (error) {
       say.push(`${path.basename(thread.cwd)}: ${error.message}`);
