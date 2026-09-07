@@ -957,7 +957,9 @@ async function syncAll(opts) {
       const down = toClaude(ctx);
       if (up.moved) say.push(`${path.basename(thread.cwd)}: sent ${up.moved} to Codex`);
       if (down.moved) say.push(`${path.basename(thread.cwd)}: brought ${down.moved} back to Claude`);
-      rememberMtimes(key);
+      // Work held back because Claude was busy must be retried. Stamping the
+      // files as seen would strand it until one of them happened to change.
+      if (!down.held) rememberMtimes(key);
     } catch (error) {
       say.push(`${path.basename(thread.cwd)}: ${error.message}`);
     }
