@@ -828,8 +828,14 @@ function hookPull(opts) {
   markCodexRead(ctx, marks);
   const context = `${items.length} new turns happened in Codex since your last message. `
     + `They are part of this same conversation, so take them as context:\n${renderFromCodex(items)}`;
+
+  // Say so on screen as well. Context arriving invisibly is indistinguishable
+  // from nothing arriving, which is how a working pull reads as a broken one.
+  const asked = items.filter((i) => i.kind === "user").map((i) => i.text.replace(/^\[Codex\]\s*/, ""));
+  const summary = asked.length ? `: ${asked.map((q) => `"${q.slice(0, 60)}"`).join(", ")}` : "";
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context },
+    systemMessage: `relay: carried ${items.length} turns over from Codex${summary}`,
     suppressOutput: true,
   }));
 }
