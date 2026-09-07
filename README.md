@@ -31,12 +31,13 @@ and 7 screenshots.
 | messages                 | yes               | yes   |
 | tool calls and output    | no                | yes   |
 | screenshots              | no                | yes   |
+| attached files           | no                | yes   |
 | run again to top up      | no                | yes   |
 | Codex back to Claude     | no                | yes   |
 
 ## Install
 
-Needs Node 18+, Claude Code, and the Codex CLI, both signed in.
+Needs Node 18+, Claude Code and the Codex CLI, both signed in.
 
 ```
 git clone https://github.com/bloodykheeng/ai-context-relay
@@ -44,7 +45,21 @@ cd ai-context-relay
 node relay.mjs --install
 ```
 
-That is it. A quiet watcher starts at every logon and covers every project.
+A quiet watcher starts at every logon and covers every project.
+
+For the live pull, add this to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command",
+                     "command": "node \"$USERPROFILE/.claude/tools/relay.mjs\" --hook",
+                     "timeout": 15 } ] }
+    ]
+  }
+}
+```
 
 ## Using it
 
@@ -54,66 +69,124 @@ Nothing to type. When one tool runs out, open the other.
   Claude runs out
         |
         v
-  open Codex  ->  click the thread  ->  carry on
+  open Codex  ->  the conversation is in the thread  ->  carry on
         |
         v
   Codex runs out
         |
         v
-  back to Claude  ->  resume the session  ->  carry on
+  back to Claude  ->  it is in the session  ->  carry on
 ```
 
-If you ever want to check or nudge it:
+## Commands
 
 ```
-relay              sync now
-relay --status     what is paired
-relay --new        start a fresh Codex thread
-relay --uninstall  stop it starting at logon
+relay                sync now: push to Codex, print anything new from Codex
+relay --now          also write it into this session, without waiting
+relay --status       what is paired with what
+relay --new          start a fresh Codex thread for this session
+relay --reset        unpair this session
+relay --watch        run the watcher in the foreground
+relay --install      run the watcher at every logon
+relay --uninstall    stop it starting at logon
+relay --help         this list
 ```
+
+### Flags
+
+| flag | meaning |
+| --- | --- |
+| `--cwd <dir>` | project directory (default: current) |
+| `--session <file>` | act on one specific Claude transcript |
+| `--tools native\|text` | carry tool calls as call items, or as prose (default: `native`) |
+| `--no-thinking` | leave Claude's reasoning out |
+| `--interval <sec>` | how often `--watch` polls (default: 10) |
+| `--force` | alias of `--now` |
+| `--hook` | pull-only mode for the `UserPromptSubmit` hook |
 
 ## How it works
 
-Both tools keep their history as plain text files. relay reads one and writes
-the other.
+Both tools keep their history as JSONL on disk.
 
 ```
-  ~/.claude/projects/<project>/<session>.jsonl     Claude writes as you talk
-                     |
-                     |  every 15s: anything new?
-                     |  reads only the new lines
-                     v
-                   relay
-                     |
-                     v
-  ~/.codex/sessions/YYYY/MM/DD/rollout-<id>.jsonl  Codex reads
+  ~/.claude/projects/<project>/<session>.jsonl      Claude Code
+  ~/.codex/sessions/YYYY/MM/DD/rollout-<id>.jsonl   Codex
+  ~/.codex/state_5.sqlite                           Codex chats list
 ```
 
-Codex creates the thread, over the same app-server call the official plugin
-uses. relay only appends to the file afterwards, and never writes to Codex's
-database.
+### Claude to Codex
 
-Records relay writes are tagged, and tagged records are never read back, so the
-two sides cannot echo each other.
+The watcher notices a transcript change (`fs.watch`, debounced 1.5s), reads the
+bytes added since last time, and appends them to the paired Codex session file.
+Codex re-reads a session by byte offset whenever a thread is opened, so
+appending is how it reads its own history.
 
-Idle cost: about 0.4% of one core and 39MB. It sleeps unless a file changed.
+The thread itself is never created by hand. relay asks Codex to make it over
+the app-server JSON-RPC (`externalAgentConfig/import`), the same call the
+official plugin uses, because only Codex can write the chats-list row. relay
+then clears the body Codex wrote and appends its own richer version, so nothing
+appears twice.
+
+### Codex to Claude
+
+Two paths, sharing one read marker so nothing is delivered twice.
+
+- **Written in**, once a session has been idle 90 seconds, meaning you left it.
+  Appending under a session Claude Code is still writing lands records in the
+  middle of a turn.
+- **Delivered live** by the `UserPromptSubmit` hook while you are still typing,
+  as `additionalContext`, plus a visible `relay: carried N turns over from Codex`.
+
+`--now` skips the idle wait. Reopening the session is what shows a written-in
+turn: Claude Code does not re-read a transcript it already has open.
+
+### What stops it looping
+
+- Records relay writes into Claude carry `relayOrigin`, and are skipped on read.
+- Turns relay pushes into Codex carry a `[Claude]` label, and are skipped on pull.
+- A tool call carries no label, so relay also marks its own writes as read, and
+  only when everything Codex had was already consumed.
+
+### Which threads it reads
+
+Every Codex thread whose recorded `cwd` is this project, not just the paired
+one. You use whichever thread is open; the pairing is bookkeeping. A thread
+relay made resumes where it stopped; a thread **Codex** made is carried whole,
+because its history is exactly what Claude has never seen.
+
+### Attachments
+
+Screenshots are inlined as `data:` URIs. A `file://` URL is rejected outright by
+the API and fails every later turn.
+
+PDFs, spreadsheets and documents are written to `~/.codex/relay-media`, named by
+content hash, and named in the message with type, size and path. They are not
+inlined: a real 53MB PDF is 71MB of base64 in a file Codex re-reads constantly.
+
+### Tunables
+
+| constant | value | what it governs |
+| --- | --- | --- |
+| `SETTLE_MS` | 1500 | quiet period before syncing after a file change |
+| `LEFT_THE_SESSION_MS` | 90s | idle time before writing into a Claude session |
+| `MIN_ITEMS_TO_PAIR` | 6 | a chat must be a conversation before it gets a thread |
+| `PAIR_WINDOW_MS` | 30m | only recently used sessions are paired |
+| `ACTIVE_WINDOW_MS` | 24h | how far back threads and sessions are considered |
+| `MAX_ITEMS_PULLED` | 60 | cap on a long Codex thread arriving at once |
+
+Idle cost: about 0.4% of one core and 39MB.
 
 ## Platforms
 
-| Windows | works |
+| Windows | supported and tested |
 | macOS, Linux | works, except `--install`. Use `relay --watch`, launchd or systemd |
 | iOS | not possible, relay reads local files |
 
 ## Worth knowing
 
-Appending to Codex's session files is not a supported interface. It works
-because the format is stable and Codex re-reads a file that has grown. If that
-changes, relay breaks.
-
-Your Claude transcript is never modified, except when carrying Codex work back,
-and only when Claude has not touched it for 20 seconds.
-
-Screenshots are written once to `~/.codex/relay-media`, named by content hash.
+Appending to Codex session files is not a supported interface. It works because
+the format is stable and Codex re-reads a file that has grown. If that changes,
+relay breaks. It never writes to Codex's database; only Codex does that.
 
 ## Related
 
