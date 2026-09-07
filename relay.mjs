@@ -50,6 +50,7 @@ function parseArgs(argv) {
     else if (a === "--reset") opts.reset = true;
     else if (a === "--new") opts.fresh = true;
     else if (a === "--hook") opts.hook = true;
+    else if (a === "--now" || a === "--force") opts.now = true;
     else if (a === "--install") opts.install = true;
     else if (a === "--uninstall") opts.uninstall = true;
     else if (a === "--no-thinking") opts.thinking = false;
@@ -860,7 +861,15 @@ async function sync(opts, quiet = false) {
   // Printed rather than written into the transcript: this output lands in the
   // conversation through the command that ran it, which is the only way in
   // that Claude Code actually owns.
-  if (items.length) {
+  if (items.length && opts.now) {
+    // Write it in rather than printing it, without waiting for the session to
+    // go idle. Reopening the session is what shows it: Claude Code does not
+    // re-read a transcript it already has open.
+    writeRecords(ctx.transcript, claudeRecords(items, claudeContext(ctx.transcript)), true);
+    markCodexRead(ctx, marks);
+    console.log(`relay: wrote ${items.length} turns from Codex into this session`);
+    console.log("relay: reopen the session to see them, or just carry on and they arrive with your next message");
+  } else if (items.length) {
     console.log(`relay: ${items.length} new turns from Codex\n`);
     console.log(renderFromCodex(items));
     markCodexRead(ctx, marks);
@@ -1165,11 +1174,12 @@ async function watch(opts) {
 
 const HELP = `relay - keep a Claude Code session and a Codex thread as one conversation
 
-Claude to Codex is automatic. Codex back to Claude is read out when you run
-relay, and printed here rather than written into the session, because Claude
-Code owns its own transcripts.
+Both directions are automatic. Claude turns are written into the Codex thread.
+Codex turns are written into the Claude session once you have left it, and
+delivered live by the hook while you are still typing. --now skips the wait.
 
   relay                push, and print anything new from Codex
+  relay --now          also write it into this session, without waiting
   relay --watch        keep them in step (what --install runs)
   relay --status       what is paired with what
   relay --new          start a fresh Codex thread for this session
