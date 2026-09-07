@@ -1,0 +1,3 @@
+* text=auto eol=lf
+relay text eol=lf
+*.cmd text eol=crlf

@@ -1,0 +1,8 @@
+# local pairing state: holds absolute paths and project names
+relay-state.json
+
+# generated at install time
+relay-hidden.vbs
+
+node_modules/
+*.log
