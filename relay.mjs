@@ -672,8 +672,24 @@ async function toCodex(ctx, opts) {
     // Unmarked: this line becomes the thread's name in the chats list.
     writeRecords(rollout, [buildMeta(threadId, ctx.cwd), ...userRecords(title, "relay-turn-0", [], false)], false);
   }
+  // What relay is about to append is Claude's work, not Codex's, so it must not
+  // come back on the next pull. Text carries a [Claude] label, but a tool call
+  // does not, and those were returning as "Codex ran shell".
+  const beforeAppend = countLines(rollout);
   const records = buildRecords(fresh, { tools: opts.tools });
   if (records.length) writeRecords(rollout, records, true);
+
+  if (records.length) {
+    const state = loadState();
+    const reads = state.codexReads ?? {};
+    // Only skip past our own writes when everything Codex had was already read;
+    // otherwise unread Codex work below them would be lost.
+    if ((reads[rollout] ?? 0) >= beforeAppend) {
+      state.codexReads = { ...reads, [rollout]: countLines(rollout) };
+      saveState(state);
+      ctx.state = loadState();
+    }
+  }
   // Report what was written, not what was read: adopting a thread that already
   // holds the conversation reads everything and sends none of it.
   const moved = records.length ? fresh.length : 0;
@@ -696,10 +712,52 @@ async function toCodex(ctx, opts) {
 // under the user so the conversation looked lost. Codex session files are the
 // opposite, re-projected by byte offset whenever a thread is opened, which is
 // why the other direction can safely append.
+// Every Codex thread in this project, not just the one paired to this session.
+// You think in two apps; the pairing is bookkeeping. Work done in whichever
+// Codex thread was in front of you has to come back wherever you are in Claude.
+function codexRolloutsForProject(cwd) {
+  const found = [];
+  const walk = (dir) => {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!entry.name.startsWith("rollout-") || !entry.name.endsWith(".jsonl")) continue;
+      if (Date.now() - fs.statSync(full).mtimeMs > ACTIVE_WINDOW_MS) continue;
+      const meta = firstRecordOf(full);
+      const theirs = String(meta?.payload?.cwd ?? "").replace(/^\\\\\?\\/, "");
+      if (theirs && theirs.toLowerCase() === cwd.toLowerCase()) found.push(full);
+    }
+  };
+  walk(CODEX_SESSIONS);
+  return found;
+}
+
+// Turns relay pushed into Codex carry [Claude]; sending them back would echo.
+const cameFromClaude = (item) => String(item.text ?? "").startsWith(FROM_CLAUDE);
+
 function pendingFromCodex(ctx) {
-  const prior = ctx.state.threads[ctx.key];
-  if (!prior || !fs.existsSync(prior.rollout)) return { items: [], readTo: 0 };
-  return readCodexItems(prior.rollout, prior.codexRecords ?? 0);
+  const state = ctx.state;
+  const paired = state.threads[ctx.key];
+  const reads = state.codexReads ?? {};
+  const collected = [];
+  const marks = {};
+
+  for (const rollout of codexRolloutsForProject(ctx.cwd)) {
+    // How far this thread has been read, whichever session it was paired to.
+    // Falling back to the pairing only when it is THIS session's would skip the
+    // work waiting on a thread paired elsewhere, which is the usual case: you
+    // use whichever Codex thread is open, not the one bookkeeping picked.
+    const pairedAnywhere = Object.values(state.threads).find((t) => t.rollout === rollout);
+    const seen = reads[rollout]
+      ?? pairedAnywhere?.codexRecords
+      // Truly unseen: start at the end so a thread does not dump its history.
+      ?? countLines(rollout);
+    const { items, readTo } = readCodexItems(rollout, seen);
+    marks[rollout] = readTo;
+    for (const item of items) if (!cameFromClaude(item)) collected.push(item);
+  }
+  return { items: collected, marks };
 }
 
 function renderFromCodex(items) {
@@ -717,18 +775,21 @@ function renderFromCodex(items) {
   return lines.join("\n");
 }
 
-function markCodexRead(ctx, readTo) {
-  const prior = ctx.state.threads[ctx.key];
-  if (!prior) return;
-  ctx.state.threads[ctx.key] = { ...prior, codexRecords: readTo, updatedAt: stamp() };
-  saveState(ctx.state);
+function markCodexRead(ctx, marks) {
+  const state = loadState();
+  state.codexReads = { ...(state.codexReads ?? {}), ...marks };
+  const paired = state.threads[ctx.key];
+  if (paired && marks[paired.rollout] != null) {
+    state.threads[ctx.key] = { ...paired, codexRecords: marks[paired.rollout], updatedAt: stamp() };
+  }
+  saveState(state);
 }
 
 async function sync(opts, quiet = false) {
   const ctx = resolvePair(opts);
   const up = await toCodex(ctx, opts);
   ctx.state = loadState();
-  const { items, readTo } = pendingFromCodex(ctx);
+  const { items, marks } = pendingFromCodex(ctx);
 
   if (up.created) {
     console.log("relay: paired this session with a new Codex thread");
@@ -742,7 +803,7 @@ async function sync(opts, quiet = false) {
   if (items.length) {
     console.log(`relay: ${items.length} new turns from Codex\n`);
     console.log(renderFromCodex(items));
-    markCodexRead(ctx, readTo);
+    markCodexRead(ctx, marks);
   }
   if (!quiet && !up.moved && !items.length && !up.created) console.log("relay: already in step");
   return up.thread;
@@ -761,10 +822,10 @@ function hookPull(opts) {
   }
   if (!ctx.state.threads[ctx.key]) return;
 
-  const { items, readTo } = pendingFromCodex(ctx);
+  const { items, marks } = pendingFromCodex(ctx);
   if (items.length === 0) return;
 
-  markCodexRead(ctx, readTo);
+  markCodexRead(ctx, marks);
   const context = `${items.length} new turns happened in Codex since your last message. `
     + `They are part of this same conversation, so take them as context:\n${renderFromCodex(items)}`;
   process.stdout.write(JSON.stringify({
