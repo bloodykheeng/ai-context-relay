@@ -317,10 +317,18 @@ function itemsFrom(records, { thinking }) {
 
 const stamp = () => new Date().toISOString();
 
+// Which tool a turn actually happened in. Without this a relayed conversation
+// reads as though one side said things it never saw, and there is no way to
+// tell a Codex answer from a Claude one after the fact.
+const FROM_CLAUDE = "[Claude]";
+const FROM_CODEX = "[Codex]";
+const label = (marker, text) => (text.startsWith(marker) ? text : `${marker} ${text}`);
+
 const eventMsg = (payload) => ({ timestamp: stamp(), type: "event_msg", payload });
 const responseItem = (payload) => ({ timestamp: stamp(), type: "response_item", payload });
 
-function userRecords(text, turn, images = []) {
+function userRecords(rawText, turn, images = [], marked = true) {
+  const text = marked ? label(FROM_CLAUDE, rawText) : rawText;
   // Codex carries pasted screenshots as local_images beside the text, and as
   // input_image parts in the message itself. The part must be a data URI: the
   // thread is replayed to the API, which rejects a file:// URL outright and
@@ -337,7 +345,8 @@ function userRecords(text, turn, images = []) {
   ];
 }
 
-function assistantRecords(text) {
+function assistantRecords(rawText) {
+  const text = label(FROM_CLAUDE, rawText);
   return [
     eventMsg({ type: "agent_message", message: text, phase: null, memory_citation: null }),
     responseItem({ type: "message", role: "assistant", content: [{ type: "output_text", text }] }),
@@ -568,12 +577,16 @@ function claudeRecords(items, ctx) {
   const say = (text) => push({ ...base(), type: "assistant", message: synthetic(text) });
 
   for (const item of items) {
-    if (item.kind === "user") push({ ...base(), type: "user", message: { role: "user", content: `[in Codex] ${item.text}` } });
-    else if (item.kind === "assistant") say(item.text);
-    else if (item.kind === "tool_call") {
+    if (item.kind === "user") {
+      push({ ...base(), type: "user", message: { role: "user", content: label(FROM_CODEX, item.text) } });
+    } else if (item.kind === "assistant") {
+      say(label(FROM_CODEX, item.text));
+    } else if (item.kind === "tool_call") {
       const args = typeof item.input === "string" ? item.input : JSON.stringify(item.input);
-      say(`[Codex ran ${item.name}]\n${String(args).slice(0, 4000)}`);
-    } else if (item.kind === "tool_result" && item.text.trim()) say(`[result]\n${item.text.slice(0, 8000)}`);
+      say(`${FROM_CODEX} ran ${item.name}\n${String(args).slice(0, 4000)}`);
+    } else if (item.kind === "tool_result" && item.text.trim()) {
+      say(`${FROM_CODEX} result\n${item.text.slice(0, 8000)}`);
+    }
   }
   return records;
 }
@@ -759,7 +772,8 @@ async function toCodex(ctx, opts) {
   // header before anything else. An adopted thread already has one.
   if (!fs.existsSync(rollout)) {
     fs.mkdirSync(path.dirname(rollout), { recursive: true });
-    writeRecords(rollout, [buildMeta(threadId, ctx.cwd), ...userRecords(title, "relay-turn-0")], false);
+    // Unmarked: this line becomes the thread's name in the chats list.
+    writeRecords(rollout, [buildMeta(threadId, ctx.cwd), ...userRecords(title, "relay-turn-0", [], false)], false);
   }
   const records = buildRecords(fresh, { tools: opts.tools });
   if (records.length) writeRecords(rollout, records, true);
