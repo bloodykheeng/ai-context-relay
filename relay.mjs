@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 // relay - keep a Claude Code session and a Codex thread as one conversation.
 //
-// BOTH DIRECTIONS. Claude turns are appended to the Codex thread, and work done
-// in Codex is appended back to the Claude session. Each pass carries only what
-// is new. Codex work appears in Claude when that session is RESUMED: a window
-// already open never re-reads its own transcript.
+// The two directions are NOT symmetric, because the two tools own their files
+// differently.
 //
-//   relay              sync both ways, once
-//   relay --watch      keep them in step (this is what --install runs)
+//   Claude -> Codex   pushed automatically. A Codex session file is re-read by
+//                     byte offset whenever the thread is opened, so appending
+//                     to it is how Codex reads its own history.
+//
+//   Codex -> Claude   read out on demand by running `relay`. Claude Code holds
+//                     a session in memory, never re-reads a file it has open,
+//                     and derives the chat title from the content. Appending
+//                     made work invisible until the session was reopened and
+//                     moved the title under the user, so it is not done.
+//
+//   relay              push, and print anything new from Codex
+//   relay --watch      keep pushing (this is what --install runs)
 //   relay --status     what is paired with what
 //   relay --new        start a fresh Codex thread for this session
 //   relay --install    run the watcher at every logon
@@ -26,9 +34,6 @@ const HOME = os.homedir();
 const CLAUDE_PROJECTS = path.join(HOME, ".claude", "projects");
 const CODEX_SESSIONS = path.join(HOME, ".codex", "sessions");
 const STATE_FILE = path.join(HOME, ".claude", "tools", "relay-state.json");
-
-// A Claude session being written to right now is one we must not append to.
-const IDLE_BEFORE_WRITE_MS = 20_000;
 
 // ---------------------------------------------------------------- arguments
 
@@ -550,115 +555,6 @@ function readCodexItems(file, fromRecord) {
 
 // ---------------------------------------------------- writing Claude's side
 
-const synthetic = (text) => ({
-  id: crypto.randomUUID(), type: "message", role: "assistant", model: "<synthetic>",
-  stop_reason: "stop_sequence", stop_sequence: "",
-  content: [{ type: "text", text }],
-  usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-});
-
-// Codex tool activity arrives as text rather than as tool_use blocks: a Claude
-// tool_use must name a tool Claude actually has, and Codex's are not the same.
-function claudeRecords(items, ctx) {
-  const records = [];
-  let parent = ctx.parentUuid;
-
-  const push = (record) => {
-    record.uuid = crypto.randomUUID();
-    record.timestamp = stamp();
-    records.push(record);
-    parent = record.uuid;
-  };
-  const base = () => ({
-    parentUuid: parent, isSidechain: false, userType: "external", entrypoint: "relay",
-    cwd: ctx.cwd, sessionId: ctx.sessionId, version: ctx.version, gitBranch: ctx.gitBranch,
-    relayOrigin: "codex",
-  });
-  const say = (text) => push({ ...base(), type: "assistant", message: synthetic(text) });
-
-  for (const item of items) {
-    if (item.kind === "user") {
-      push({ ...base(), type: "user", message: { role: "user", content: label(FROM_CODEX, item.text) } });
-    } else if (item.kind === "assistant") {
-      say(label(FROM_CODEX, item.text));
-    } else if (item.kind === "tool_call") {
-      const args = typeof item.input === "string" ? item.input : JSON.stringify(item.input);
-      say(`${FROM_CODEX} ran ${item.name}\n${String(args).slice(0, 4000)}`);
-    } else if (item.kind === "tool_result" && item.text.trim()) {
-      say(`${FROM_CODEX} result\n${item.text.slice(0, 8000)}`);
-    }
-  }
-  return records;
-}
-
-function claudeContext(file) {
-  const records = readJsonl(file);
-  const anchor = [...records].reverse().find((r) => r.sessionId) ?? {};
-  return {
-    parentUuid: records[records.length - 1]?.uuid ?? null,
-    sessionId: anchor.sessionId ?? path.basename(file, ".jsonl"),
-    cwd: anchor.cwd ?? process.cwd(),
-    version: anchor.version ?? "2.1.263",
-    gitBranch: anchor.gitBranch ?? null,
-  };
-}
-
-// ------------------------------------- adopting a chat that began in Codex
-
-// Every Codex rollout sitting in this project that relay did not write itself.
-function codexThreadsFor(cwd, ours) {
-  const found = [];
-  const walk = (dir) => {
-    if (!fs.existsSync(dir)) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl") && !ours.has(full)) {
-        const meta = firstRecordOf(full);
-        const theirs = String(meta?.payload?.cwd ?? "").toLowerCase();
-        // A null cwd asks for every project, which is what the daemon wants.
-        if (meta?.type === "session_meta" && theirs && (!cwd || theirs === cwd.toLowerCase())) {
-          found.push({ file: full, mtime: fs.statSync(full).mtimeMs });
-        }
-      }
-    }
-  };
-  walk(CODEX_SESSIONS);
-  return found.sort((a, b) => b.mtime - a.mtime);
-}
-
-// Claude opens a session by reading its transcript, so starting one from a
-// Codex thread means writing that transcript rather than driving the CLI.
-function adoptFromCodex(cwd, rollout) {
-  const { items } = readCodexItems(rollout, 0);
-  if (items.length === 0) return null;
-
-  const sessionId = crypto.randomUUID();
-  const dir = projectDir(cwd);
-  fs.mkdirSync(dir, { recursive: true });
-  const transcript = path.join(dir, `${sessionId}.jsonl`);
-
-  const ctx = {
-    parentUuid: null, sessionId, cwd,
-    version: "2.1.263", gitBranch: gitInfo(cwd)?.branch ?? null,
-  };
-  writeRecords(transcript, claudeRecords(items, ctx), false);
-
-  const state = loadState();
-  state.threads[transcript] = {
-    threadId: path.basename(rollout).replace(/^rollout-.*?-(.{36})\.jsonl$/, "$1"),
-    rollout, transcript, cwd,
-    title: `Started in Codex: ${path.basename(cwd)}`,
-    itemCount: readTurns(transcript, { thinking: true }).length,
-    codexRecords: countLines(rollout),
-    updatedAt: stamp(),
-  };
-  saveState(state);
-  return { transcript, moved: items.length };
-}
-
-// ------------------------------------------------------------------- state
-
 const loadState = () => readJson(STATE_FILE, { threads: {} });
 
 function saveState(state) {
@@ -791,44 +687,63 @@ async function toCodex(ctx, opts) {
   return { moved, thread: ctx.state.threads[ctx.key], created: !prior };
 }
 
-function toClaude(ctx) {
+// Codex work is READ OUT, never written into a Claude transcript.
+//
+// Claude Code owns its session files: it holds them in memory, does not re-read
+// one it has open, and derives the chat title from the content. Appending meant
+// the work was invisible until the session was reopened, and the title moved
+// under the user so the conversation looked lost. Codex session files are the
+// opposite, re-projected by byte offset whenever a thread is opened, which is
+// why the other direction can safely append.
+function pendingFromCodex(ctx) {
   const prior = ctx.state.threads[ctx.key];
-  if (!prior || !fs.existsSync(prior.rollout)) return { moved: 0 };
+  if (!prior || !fs.existsSync(prior.rollout)) return { items: [], readTo: 0 };
+  return readCodexItems(prior.rollout, prior.codexRecords ?? 0);
+}
 
-  const { items, readTo } = readCodexItems(prior.rollout, prior.codexRecords ?? 0);
-  if (items.length === 0) return { moved: 0 };
+function renderFromCodex(items) {
+  const lines = [];
+  for (const item of items) {
+    if (item.kind === "user") lines.push(`\n${FROM_CODEX} you asked: ${item.text}`);
+    else if (item.kind === "assistant") lines.push(`\n${FROM_CODEX} ${item.text}`);
+    else if (item.kind === "tool_call") {
+      const args = typeof item.input === "string" ? item.input : JSON.stringify(item.input);
+      lines.push(`\n${FROM_CODEX} ran ${item.name}: ${String(args).slice(0, 800)}`);
+    } else if (item.kind === "tool_result" && item.text.trim()) {
+      lines.push(`${FROM_CODEX} result: ${item.text.slice(0, 2000)}`);
+    }
+  }
+  return lines.join("\n");
+}
 
-  // Never append to a transcript Claude is still writing to, or our records
-  // land in the middle of a turn the extension has not finished.
-  if (Date.now() - fs.statSync(ctx.transcript).mtimeMs < IDLE_BEFORE_WRITE_MS) return { moved: 0, held: items.length };
-
-  writeRecords(ctx.transcript, claudeRecords(items, claudeContext(ctx.transcript)), true);
-  ctx.state.threads[ctx.key] = {
-    ...prior,
-    codexRecords: readTo,
-    // Our own records are skipped on read, but stepping past them keeps the
-    // next pass from re-reading what we just wrote.
-    claudeBytes: fs.statSync(ctx.transcript).size,
-    updatedAt: stamp(),
-  };
+function markCodexRead(ctx, readTo) {
+  const prior = ctx.state.threads[ctx.key];
+  if (!prior) return;
+  ctx.state.threads[ctx.key] = { ...prior, codexRecords: readTo, updatedAt: stamp() };
   saveState(ctx.state);
-  return { moved: items.length };
 }
 
 async function sync(opts, quiet = false) {
   const ctx = resolvePair(opts);
   const up = await toCodex(ctx, opts);
   ctx.state = loadState();
-  const down = toClaude(ctx);
+  const { items, readTo } = pendingFromCodex(ctx);
 
   if (up.created) {
     console.log("relay: paired this session with a new Codex thread");
     console.log(`relay: open Codex, it is at the top of your recent chats as "${up.thread.title}"`);
   }
   if (up.moved) console.log(`relay: sent ${up.moved} items to Codex`);
-  if (down.moved) console.log(`relay: brought ${down.moved} items back into Claude`);
-  if (down.held) console.log(`relay: holding ${down.held} items from Codex until Claude is idle`);
-  if (!quiet && !up.moved && !down.moved && !up.created) console.log("relay: already in step");
+
+  // Printed rather than written into the transcript: this output lands in the
+  // conversation through the command that ran it, which is the only way in
+  // that Claude Code actually owns.
+  if (items.length) {
+    console.log(`relay: ${items.length} new turns from Codex\n`);
+    console.log(renderFromCodex(items));
+    markCodexRead(ctx, readTo);
+  }
+  if (!quiet && !up.moved && !items.length && !up.created) console.log("relay: already in step");
   return up.thread;
 }
 
@@ -965,15 +880,12 @@ async function syncAll(opts) {
     const codexMtime = fs.existsSync(thread.rollout) ? fs.statSync(thread.rollout).mtimeMs : 0;
     if (thread.claudeMtime === claudeMtime && thread.codexMtime === codexMtime) continue;
     try {
+      // Push only. The watcher never writes to a Claude transcript: that file
+      // belongs to Claude Code, and Codex work is collected by `relay` instead.
       const ctx = { cwd: thread.cwd, transcript: key, key, state: loadState() };
       const up = await toCodex(ctx, opts);
-      ctx.state = loadState();
-      const down = toClaude(ctx);
       if (up.moved) say.push(`${path.basename(thread.cwd)}: sent ${up.moved} to Codex`);
-      if (down.moved) say.push(`${path.basename(thread.cwd)}: brought ${down.moved} back to Claude`);
-      // Work held back because Claude was busy must be retried. Stamping the
-      // files as seen would strand it until one of them happened to change.
-      if (!down.held) rememberMtimes(key);
+      rememberMtimes(key);
     } catch (error) {
       say.push(`${path.basename(thread.cwd)}: ${error.message}`);
     }
@@ -1003,23 +915,9 @@ async function syncAll(opts) {
     }
   }
 
-  // A chat started in Codex with no Claude session yet.
-  state = loadState();
-  const ours = new Set(Object.values(state.threads).map((t) => t.rollout));
-  const adopted = new Set(Object.values(state.threads).map((t) => t.cwd.toLowerCase()));
-  for (const { file, mtime } of codexThreadsFor(null, ours, true)) {
-    if (Date.now() - mtime > ACTIVE_WINDOW_MS) continue;
-    const cwd = firstRecordOf(file)?.payload?.cwd;
-    if (!cwd || adopted.has(String(cwd).toLowerCase())) continue;
-    try {
-      const result = adoptFromCodex(normaliseCwd(cwd), file);
-      if (result) {
-        adopted.add(String(cwd).toLowerCase());
-        say.push(`${path.basename(cwd)}: started a Claude session from Codex, ${result.moved} items`);
-      }
-    } catch { /* retried next pass */ }
-  }
-
+  // A chat begun in Codex is not turned into a Claude session any more. Writing
+  // Claude's session files is what caused titles to move and work to go missing;
+  // `relay` reads Codex out into the conversation instead.
   return say;
 }
 
@@ -1047,10 +945,11 @@ async function watch(opts) {
 
 const HELP = `relay - keep a Claude Code session and a Codex thread as one conversation
 
-Both directions. Codex work appears in Claude when you RESUME that session;
-a window already open never re-reads its own transcript.
+Claude to Codex is automatic. Codex back to Claude is read out when you run
+relay, and printed here rather than written into the session, because Claude
+Code owns its own transcripts.
 
-  relay                sync both ways, once
+  relay                push, and print anything new from Codex
   relay --watch        keep them in step (what --install runs)
   relay --status       what is paired with what
   relay --new          start a fresh Codex thread for this session
