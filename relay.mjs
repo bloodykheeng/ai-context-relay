@@ -1,14 +1,17 @@
 #!/usr/bin/env node
-// relay - carry a Claude Code session into Codex so `codex resume` continues the work.
+// relay - keep a Claude Code session and a Codex thread as one conversation.
 //
-// Reads the Claude transcript for a project and writes a native Codex rollout file.
-// Re-running appends only the turns added since last time.
+// BOTH DIRECTIONS. Claude turns are appended to the Codex thread, and work done
+// in Codex is appended back to the Claude session. Each pass carries only what
+// is new. Codex work appears in Claude when that session is RESUMED: a window
+// already open never re-reads its own transcript.
 //
-//   relay                push new turns for the current project
-//   relay --open         push, then print the resume command
-//   relay --watch        keep pushing as Claude writes
-//   relay --status       show what maps to what
-//   relay --reset        forget the mapping, next push starts a new thread
+//   relay              sync both ways, once
+//   relay --watch      keep them in step (this is what --install runs)
+//   relay --status     what is paired with what
+//   relay --new        start a fresh Codex thread for this session
+//   relay --install    run the watcher at every logon
+//   relay --uninstall  stop that
 //
 // Flags: --cwd <dir>  --session <file>  --tools native|text  --no-thinking  --interval <sec>
 
@@ -893,13 +896,18 @@ async function watch(opts) {
   }
 }
 
-const HELP = `relay - carry a Claude Code session into Codex
+const HELP = `relay - keep a Claude Code session and a Codex thread as one conversation
 
-  relay                push new turns for the current project
-  relay --open         push, then print the resume command
-  relay --watch        keep pushing as Claude writes
-  relay --status       show what maps to what
-  relay --reset        forget the mapping, next push starts a new thread
+Both directions. Codex work appears in Claude when you RESUME that session;
+a window already open never re-reads its own transcript.
+
+  relay                sync both ways, once
+  relay --watch        keep them in step (what --install runs)
+  relay --status       what is paired with what
+  relay --new          start a fresh Codex thread for this session
+  relay --reset        unpair this session
+  relay --install      run the watcher at every logon
+  relay --uninstall    stop that
 
   --cwd <dir>          project directory (default: current)
   --session <file>     a specific Claude transcript
