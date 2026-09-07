@@ -2,32 +2,41 @@
 
 Keep a Claude Code session and a Codex thread as one conversation.
 
-Work in either tool. Whichever one you run out of, the other has everything when
-you open it. No export step, no thread ids to remember.
+Run out of one, open the other, everything is already there.
 
-## Why
+```
+          you                              you
+           |                                |
+    +------v------+                  +------v------+
+    | Claude Code |                  |    Codex    |
+    +------+------+                  +------+------+
+           |                                |
+           +----------->  relay  <----------+
+                      both directions
+```
 
-Claude and Codex bill against different accounts, so when one hits its limit the
-other still has capacity. What does not carry over is the conversation. The
-official transfer in `openai/codex-plugin-cc` is one-way, one-shot, and drops
-every tool call: of a 234 record Claude session it carried 6 plain messages and
-none of the 31 tool calls, 30 results or 7 screenshots.
+## The problem
 
-relay carries the lot, both directions, continuously.
+Claude and Codex bill separately, so when one runs out the other still has room.
+What does not follow you is the conversation.
 
-## What it does
+The official transfer copies plain messages once, then stops. From a real 234
+record session it carried 6 messages and dropped all 31 tool calls, 30 results
+and 7 screenshots.
 
-| | official transfer | relay |
-| --- | --- | --- |
-| tool calls and their output | dropped | carried |
-| screenshots | dropped | carried |
-| assistant reasoning | dropped | carried as text |
-| run it again to top up | refuses, one import per session | appends what is new |
-| Codex back to Claude | not supported | supported |
+## What relay carries
+
+|                          | official transfer | relay |
+| ------------------------ | ----------------- | ----- |
+| messages                 | yes               | yes   |
+| tool calls and output    | no                | yes   |
+| screenshots              | no                | yes   |
+| run again to top up      | no                | yes   |
+| Codex back to Claude     | no                | yes   |
 
 ## Install
 
-Needs Node 18+, Claude Code and the Codex CLI, both signed in.
+Needs Node 18+, Claude Code, and the Codex CLI, both signed in.
 
 ```
 git clone https://github.com/bloodykheeng/ai-context-relay
@@ -35,66 +44,84 @@ cd ai-context-relay
 node relay.mjs --install
 ```
 
-`--install` registers a windowless watcher that starts at every logon and covers
-every project. Add the folder to PATH to get the short commands below.
+That is it. A quiet watcher starts at every logon and covers every project.
 
-Remove it with `relay --uninstall`.
+## Using it
 
-## Use
+Nothing to type. When one tool runs out, open the other.
 
-Nothing, day to day. When one tool runs out, open the other.
+```
+  Claude runs out
+        |
+        v
+  open Codex  ->  click the thread  ->  carry on
+        |
+        v
+  Codex runs out
+        |
+        v
+  back to Claude  ->  resume the session  ->  carry on
+```
 
-| | |
-| --- | --- |
-| `relay` | sync both ways, now |
-| `relay --status` | what is paired with what |
-| `relay --new` | start a fresh Codex thread for this session |
-| `relay --watch` | run the watcher in the foreground |
-| `relay --uninstall` | stop starting at logon |
+If you ever want to check or nudge it:
 
-Options: `--cwd <dir>`, `--session <file>`, `--tools native|text`,
-`--no-thinking`, `--interval <sec>`.
+```
+relay              sync now
+relay --status     what is paired
+relay --new        start a fresh Codex thread
+relay --uninstall  stop it starting at logon
+```
 
 ## How it works
 
-Both tools keep their history as JSONL on disk. Claude writes
-`~/.claude/projects/<slug>/<session>.jsonl`; Codex writes
-`~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl` and lists chats from a
-`threads` table in `~/.codex/state_5.sqlite`.
+Both tools keep their history as plain text files. relay reads one and writes
+the other.
 
-relay asks Codex to create the thread over the app-server JSON-RPC
-(`externalAgentConfig/import`), the same call the official plugin makes, then
-appends the full conversation into the session file Codex made. Codex projects a
-rollout by byte offset, so appended records are picked up. Records relay writes
-are tagged, and tagged records are never read back out, so the two sides cannot
-echo each other.
+```
+  ~/.claude/projects/<project>/<session>.jsonl     Claude writes as you talk
+                     |
+                     |  every 15s: anything new?
+                     |  reads only the new lines
+                     v
+                   relay
+                     |
+                     v
+  ~/.codex/sessions/YYYY/MM/DD/rollout-<id>.jsonl  Codex reads
+```
 
-It never writes to Codex's database. Only Codex does that.
+Codex creates the thread, over the same app-server call the official plugin
+uses. relay only appends to the file afterwards, and never writes to Codex's
+database.
+
+Records relay writes are tagged, and tagged records are never read back, so the
+two sides cannot echo each other.
+
+Idle cost: about 0.4% of one core and 39MB. It sleeps unless a file changed.
 
 ## Platforms
 
-- Windows: supported and tested.
-- macOS and Linux: everything works except `--install`, which is written against
-  the Windows Startup folder. Use launchd or systemd, or run `relay --watch`.
-- iOS: not possible. relay reads local session files.
+| Windows | works |
+| macOS, Linux | works, except `--install`. Use `relay --watch`, launchd or systemd |
+| iOS | not possible, relay reads local files |
 
-## Caveats
+## Worth knowing
 
-Writing into Codex's session directory is not a supported interface. It works
-because the rollout format is stable and Codex re-reads a file that has grown.
-If OpenAI changes that format, relay breaks. Your Claude transcript is the source
-of truth and is never modified, except when carrying Codex work back, which only
-happens when Claude has not touched the file for 20 seconds.
+Appending to Codex's session files is not a supported interface. It works
+because the format is stable and Codex re-reads a file that has grown. If that
+changes, relay breaks.
+
+Your Claude transcript is never modified, except when carrying Codex work back,
+and only when Claude has not touched it for 20 seconds.
 
 Screenshots are written once to `~/.codex/relay-media`, named by content hash.
 
 ## Related
 
-The plugin's own transfer is broken on Windows, reporting failure after a
-successful import: it looks the thread up by a verbatim `\\?\` path and by a
-hash of a transcript that keeps growing, so the match can never succeed. See
-`openai/codex-plugin-cc` issues #618, #514, #417 and PRs #701, #469. Those PRs
-are the real fix for that bug. relay is a separate tool, not a patch.
+The plugin's own transfer is broken on Windows: it reports failure after a
+successful import, because it looks the thread up by a verbatim `\\?\` path and
+by a hash of a transcript that keeps growing. See `openai/codex-plugin-cc`
+issues #618, #514, #417 and PRs #701, #469. Those PRs are the real fix for that
+bug. relay is a separate tool, not a patch.
 
 ## Licence
 

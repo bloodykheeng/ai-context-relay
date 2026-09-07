@@ -147,8 +147,8 @@ function findTranscript(cwd) {
   for (const entry of fs.readdirSync(CLAUDE_PROJECTS)) {
     const candidate = newestFile(path.join(CLAUDE_PROJECTS, entry));
     if (!candidate) continue;
-    const first = readJsonl(candidate).find((r) => r.cwd);
-    if (first && String(first.cwd).toLowerCase() === target) return candidate;
+    const found = cwdOf(candidate);
+    if (found && found.toLowerCase() === target) return candidate;
   }
   return null;
 }
@@ -192,9 +192,35 @@ function saveImage(block) {
 // Flatten Claude's records into the turn sequence Codex needs. Everything that
 // is bookkeeping rather than conversation (attachments, queue operations, mode
 // changes, file snapshots) is dropped.
-function readTurns(file, { thinking }) {
+const readTurns = (file, opts) => itemsFrom(readJsonl(file), opts);
+
+// A live transcript only ever grows, so re-reading it whole every pass is the
+// difference between a few percent of a core and nothing. Read from where the
+// last pass stopped, and never past the final newline: the tail of an active
+// file is a half-written record.
+function readTurnsSince(file, fromByte, opts) {
+  const size = fs.statSync(file).size;
+  if (fromByte >= size) return { items: [], nextByte: size };
+
+  const length = size - fromByte;
+  const buffer = Buffer.alloc(length);
+  const handle = fs.openSync(file, "r");
+  try { fs.readSync(handle, buffer, 0, length, fromByte); } finally { fs.closeSync(handle); }
+
+  const text = buffer.toString("utf8");
+  const lastNewline = text.lastIndexOf("\n");
+  if (lastNewline === -1) return { items: [], nextByte: fromByte };
+
+  const complete = text.slice(0, lastNewline + 1);
+  const records = complete.split("\n").filter((l) => l.trim())
+    .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(Boolean);
+  return { items: itemsFrom(records, opts), nextByte: fromByte + Buffer.byteLength(complete, "utf8") };
+}
+
+function itemsFrom(records, { thinking }) {
   const items = [];
-  for (const rec of readJsonl(file)) {
+  for (const rec of records) {
     // Skip anything relay wrote, or the two sides echo each other forever.
     if (rec.relayOrigin) continue;
     const content = rec.message?.content;
@@ -509,7 +535,7 @@ function codexThreadsFor(cwd, ours) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
       else if (entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl") && !ours.has(full)) {
-        const meta = readJsonl(full)[0];
+        const meta = firstRecordOf(full);
         const theirs = String(meta?.payload?.cwd ?? "").toLowerCase();
         // A null cwd asks for every project, which is what the daemon wants.
         if (meta?.type === "session_meta" && theirs && (!cwd || theirs === cwd.toLowerCase())) {
@@ -563,7 +589,32 @@ function saveState(state) {
 
 // ------------------------------------------------------------------ commands
 
-const countLines = (file) => (fs.existsSync(file) ? readJsonl(file).length : 0);
+// Counting newlines beats parsing every record just to learn how many there are.
+function countLines(file) {
+  if (!fs.existsSync(file)) return 0;
+  const text = fs.readFileSync(file, "utf8");
+  let lines = 0;
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lines++;
+  return text.endsWith("\n") ? lines : lines + 1;
+}
+
+// A session file's header is its first line. Reading the whole file to reach it
+// costs megabytes per rollout, and the watcher does this across every one.
+function firstRecordOf(file) {
+  let handle;
+  try {
+    handle = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(65536);
+    const read = fs.readSync(handle, buffer, 0, buffer.length, 0);
+    const text = buffer.subarray(0, read).toString("utf8");
+    const end = text.indexOf("\n");
+    return JSON.parse(end === -1 ? text : text.slice(0, end));
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
 
 function resolvePair(opts) {
   const cwd = normaliseCwd(opts.cwd ?? process.cwd());
@@ -593,9 +644,26 @@ async function pairWith(ctx, opts = {}) {
 
 async function toCodex(ctx, opts) {
   const prior = ctx.state.threads[ctx.key];
-  const items = readTurns(ctx.transcript, { thinking: opts.thinking });
-  const fresh = items.slice(prior?.itemCount ?? 0);
-  if (prior && fresh.length === 0) return { moved: 0, thread: prior };
+
+  // Once a pairing knows where it stopped, only the new bytes are read. A
+  // pairing made before that was recorded falls back to reading it whole.
+  const incremental = prior?.claudeBytes != null;
+  const slice = incremental
+    ? readTurnsSince(ctx.transcript, prior.claudeBytes, { thinking: opts.thinking })
+    : null;
+  const items = incremental ? slice.items : readTurns(ctx.transcript, { thinking: opts.thinking });
+  const fresh = incremental ? slice.items : items.slice(prior?.itemCount ?? 0);
+  const nextByte = incremental ? slice.nextByte : fs.statSync(ctx.transcript).size;
+
+  if (prior && fresh.length === 0) {
+    // Record where we stopped even when nothing moved, or a pairing made
+    // before offsets existed never gets one and re-reads the file forever.
+    if (nextByte !== prior.claudeBytes) {
+      ctx.state.threads[ctx.key] = { ...prior, claudeBytes: nextByte, updatedAt: stamp() };
+      saveState(ctx.state);
+    }
+    return { moved: 0, thread: prior };
+  }
 
   const pair = prior ?? (await pairWith(ctx, opts));
   const { threadId, rollout, title } = pair;
@@ -610,7 +678,9 @@ async function toCodex(ctx, opts) {
 
   ctx.state.threads[ctx.key] = {
     ...(prior ?? {}), threadId, rollout, title, cwd: ctx.cwd, transcript: ctx.transcript,
-    itemCount: items.length, codexRecords: countLines(rollout), updatedAt: stamp(),
+    itemCount: incremental ? (prior.itemCount ?? 0) + fresh.length : items.length,
+    claudeBytes: nextByte,
+    codexRecords: countLines(rollout), updatedAt: stamp(),
   };
   saveState(ctx.state);
   return { moved: fresh.length, thread: ctx.state.threads[ctx.key], created: !prior };
@@ -631,7 +701,9 @@ function toClaude(ctx) {
   ctx.state.threads[ctx.key] = {
     ...prior,
     codexRecords: countLines(prior.rollout),
-    itemCount: readTurns(ctx.transcript, { thinking: true }).length,
+    // Our own records are skipped on read, but stepping past them keeps the
+    // next pass from re-reading what we just wrote.
+    claudeBytes: fs.statSync(ctx.transcript).size,
     updatedAt: stamp(),
   };
   saveState(ctx.state);
@@ -716,6 +788,36 @@ const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const recentlyTouched = (file) => Date.now() - fs.statSync(file).mtimeMs < ACTIVE_WINDOW_MS;
 
+// Stamped after a pass so the next one can tell at a glance that nothing moved.
+function rememberMtimes(key) {
+  const state = loadState();
+  const thread = state.threads[key];
+  if (!thread) return;
+  thread.claudeMtime = fs.existsSync(key) ? fs.statSync(key).mtimeMs : 0;
+  thread.codexMtime = fs.existsSync(thread.rollout) ? fs.statSync(thread.rollout).mtimeMs : 0;
+  saveState(state);
+}
+
+// Discovery only needs the cwd, and it is on an early record, so read the head
+// of the file rather than parsing megabytes of conversation to find it.
+function cwdOf(file) {
+  let handle;
+  try {
+    handle = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(65536);
+    const read = fs.readSync(handle, buffer, 0, buffer.length, 0);
+    for (const line of buffer.subarray(0, read).toString("utf8").split("\n")) {
+      if (!line.includes('"cwd"')) continue;
+      try { const parsed = JSON.parse(line); if (parsed.cwd) return parsed.cwd; } catch { /* truncated tail */ }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
+
 // One pass over everything: keep known pairs in step, then adopt any chat that
 // began on one side only, whichever side that is.
 async function syncAll(opts) {
@@ -724,6 +826,12 @@ async function syncAll(opts) {
 
   for (const [key, thread] of Object.entries(state.threads)) {
     if (!fs.existsSync(key)) continue;
+    // Neither side has been written to, so there is nothing to read. Without
+    // this the watcher re-parses every transcript on every pass, which on an
+    // 8MB session is most of a core spent finding no change.
+    const claudeMtime = fs.statSync(key).mtimeMs;
+    const codexMtime = fs.existsSync(thread.rollout) ? fs.statSync(thread.rollout).mtimeMs : 0;
+    if (thread.claudeMtime === claudeMtime && thread.codexMtime === codexMtime) continue;
     try {
       const ctx = { cwd: thread.cwd, transcript: key, key, state: loadState() };
       const up = await toCodex(ctx, opts);
@@ -731,6 +839,7 @@ async function syncAll(opts) {
       const down = toClaude(ctx);
       if (up.moved) say.push(`${path.basename(thread.cwd)}: sent ${up.moved} to Codex`);
       if (down.moved) say.push(`${path.basename(thread.cwd)}: brought ${down.moved} back to Claude`);
+      rememberMtimes(key);
     } catch (error) {
       say.push(`${path.basename(thread.cwd)}: ${error.message}`);
     }
@@ -742,7 +851,7 @@ async function syncAll(opts) {
     for (const entry of fs.readdirSync(CLAUDE_PROJECTS)) {
       const transcript = newestFile(path.join(CLAUDE_PROJECTS, entry));
       if (!transcript || state.threads[transcript] || !recentlyTouched(transcript)) continue;
-      const cwd = readJsonl(transcript).find((r) => r.cwd)?.cwd;
+      const cwd = cwdOf(transcript);
       if (!cwd) continue;
       try {
         const ctx = { cwd: normaliseCwd(cwd), transcript, key: transcript, state: loadState() };
@@ -758,7 +867,7 @@ async function syncAll(opts) {
   const adopted = new Set(Object.values(state.threads).map((t) => t.cwd.toLowerCase()));
   for (const { file, mtime } of codexThreadsFor(null, ours, true)) {
     if (Date.now() - mtime > ACTIVE_WINDOW_MS) continue;
-    const cwd = readJsonl(file)[0]?.payload?.cwd;
+    const cwd = firstRecordOf(file)?.payload?.cwd;
     if (!cwd || adopted.has(String(cwd).toLowerCase())) continue;
     try {
       const result = adoptFromCodex(normaliseCwd(cwd), file);
