@@ -758,6 +758,9 @@ async function toCodex(ctx, opts) {
   }
   const records = buildRecords(fresh, { tools: opts.tools });
   if (records.length) writeRecords(rollout, records, true);
+  // Report what was written, not what was read: adopting a thread that already
+  // holds the conversation reads everything and sends none of it.
+  const moved = records.length ? fresh.length : 0;
 
   ctx.state.threads[ctx.key] = {
     ...(prior ?? {}), threadId, rollout, title, cwd: ctx.cwd, transcript: ctx.transcript,
@@ -766,7 +769,7 @@ async function toCodex(ctx, opts) {
     codexRecords: countLines(rollout), updatedAt: stamp(),
   };
   saveState(ctx.state);
-  return { moved: fresh.length, thread: ctx.state.threads[ctx.key], created: !prior };
+  return { moved, thread: ctx.state.threads[ctx.key], created: !prior };
 }
 
 function toClaude(ctx) {
@@ -874,7 +877,29 @@ const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
 // however small it is, so nothing already carried is dropped.
 const MIN_ITEMS_TO_PAIR = 6;
 
+// Pairing is for the chat in front of you. A day-wide window plus every
+// session in every project opens a thread for work you finished this morning.
+// An existing pair keeps syncing however long it has been quiet.
+const PAIR_WINDOW_MS = 30 * 60 * 1000;
+
 const recentlyTouched = (file) => Date.now() - fs.statSync(file).mtimeMs < ACTIVE_WINDOW_MS;
+
+// Every transcript across every project that has been written to lately.
+function activeSessions() {
+  if (!fs.existsSync(CLAUDE_PROJECTS)) return [];
+  const found = [];
+  for (const entry of fs.readdirSync(CLAUDE_PROJECTS)) {
+    const dir = path.join(CLAUDE_PROJECTS, entry);
+    let names;
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const file = path.join(dir, name);
+      try { if (recentlyTouched(file)) found.push(file); } catch { /* vanished */ }
+    }
+  }
+  return found;
+}
 
 // Stamped after a pass so the next one can tell at a glance that nothing moved.
 function rememberMtimes(key) {
@@ -936,9 +961,12 @@ async function syncAll(opts) {
   // A chat started in Claude with no Codex thread yet.
   state = loadState();
   if (fs.existsSync(CLAUDE_PROJECTS)) {
-    for (const entry of fs.readdirSync(CLAUDE_PROJECTS)) {
-      const transcript = newestFile(path.join(CLAUDE_PROJECTS, entry));
-      if (!transcript || state.threads[transcript] || !recentlyTouched(transcript)) continue;
+    // Every live session in the project, not just the newest one. Two chats
+    // open at once is ordinary, and taking only the newest meant the second
+    // was never looked at as long as the first kept being written to.
+    for (const transcript of activeSessions()) {
+      if (state.threads[transcript]) continue;
+      if (Date.now() - fs.statSync(transcript).mtimeMs > PAIR_WINDOW_MS) continue;
       const cwd = cwdOf(transcript);
       if (!cwd) continue;
       try {
@@ -946,7 +974,11 @@ async function syncAll(opts) {
         if (readTurns(transcript, { thinking: false }).length < MIN_ITEMS_TO_PAIR) continue;
         const up = await toCodex(ctx, opts);
         if (up.created) say.push(`${path.basename(ctx.cwd)}: opened a Codex thread, "${up.thread.title}"`);
-      } catch { /* a transcript mid-write is picked up next pass */ }
+      } catch (error) {
+        // Never silent: a pairing that fails looks exactly like one that was
+        // never attempted, which is indistinguishable from the tool ignoring you.
+        say.push(`${path.basename(transcript)}: could not pair, ${error.message}`);
+      }
     }
   }
 
@@ -972,7 +1004,17 @@ async function syncAll(opts) {
 
 async function watch(opts) {
   console.log(`relay: watching every project, checking every ${opts.interval}s. Ctrl+C to stop.`);
+  // A watcher started before an update keeps running the old code for as long
+  // as the machine stays on, which is how a fix can look like it did nothing.
+  const ownFile = new URL(import.meta.url).pathname.slice(1);
+  const startedWith = fs.statSync(ownFile).mtimeMs;
+
   for (;;) {
+    if (fs.existsSync(ownFile) && fs.statSync(ownFile).mtimeMs !== startedWith) {
+      console.log("relay: updated on disk, restarting on the new version");
+      spawn(process.execPath, [ownFile, ...process.argv.slice(2)], { detached: true, stdio: "ignore" }).unref();
+      return;
+    }
     try {
       for (const line of await syncAll(opts)) console.log(`relay: ${line}`);
     } catch (error) {
