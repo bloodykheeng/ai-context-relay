@@ -176,6 +176,45 @@ const EXTENSIONS = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif"
 
 const MIME_FOR = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 
+// Claude takes PDFs, spreadsheets, documents and plain text as `document`
+// blocks, base64 like an image. They are written out beside the screenshots so
+// nothing is lost, and named in the message so the conversation still reads.
+const EXTENSION_FOR = {
+  "application/pdf": "pdf",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/msword": "doc",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+  "text/csv": "csv",
+  "text/plain": "txt",
+  "text/markdown": "md",
+  "application/json": "json",
+};
+
+function saveDocument(block) {
+  const data = block?.source?.data;
+  if (block?.source?.type !== "base64" || !data) return null;
+  const mime = block.source.media_type ?? "application/octet-stream";
+  const extension = EXTENSION_FOR[mime] ?? "bin";
+  const name = `${crypto.createHash("sha256").update(data).digest("hex").slice(0, 32)}.${extension}`;
+  const file = path.join(MEDIA_DIR, name);
+  try {
+    fs.mkdirSync(MEDIA_DIR, { recursive: true });
+    if (!fs.existsSync(file)) fs.writeFileSync(file, Buffer.from(data, "base64"));
+    return { file, mime, title: block.title ?? block.source.title ?? null, bytes: Buffer.byteLength(data, "base64") };
+  } catch {
+    return null;
+  }
+}
+
+const describeFile = (doc) => {
+  const size = doc.bytes > 1048576
+    ? `${(doc.bytes / 1048576).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(doc.bytes / 1024))} KB`;
+  return `[attached: ${doc.title ?? path.basename(doc.file)} (${doc.mime}, ${size}) saved at ${doc.file}]`;
+};
+
 function dataUrlFor(file) {
   try {
     const extension = path.extname(file).slice(1).toLowerCase();
@@ -247,9 +286,12 @@ function itemsFrom(records, { thinking }) {
         continue;
       }
       const text = textOf(content);
-      const images = Array.isArray(content) ? content.filter((c) => c.type === "image") : [];
-      if (text.trim() || images.length) {
-        items.push({ kind: "user", text, images: images.map(saveImage).filter(Boolean) });
+      const parts = Array.isArray(content) ? content : [];
+      const images = parts.filter((c) => c.type === "image").map(saveImage).filter(Boolean);
+      const files = parts.filter((c) => c.type === "document").map(saveDocument).filter(Boolean);
+      if (text.trim() || images.length || files.length) {
+        const note = files.map(describeFile).join("\n");
+        items.push({ kind: "user", text: note ? `${text}\n\n${note}`.trim() : text, images });
       }
       continue;
     }
