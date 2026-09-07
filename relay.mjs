@@ -20,7 +20,6 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import { execFileSync, spawn } from "child_process";
-import { pathToFileURL } from "url";
 import { importClaudeSession } from "./codex-thread.mjs";
 
 const HOME = os.homedir();
@@ -175,6 +174,18 @@ const resultText = (content) => {
 const MEDIA_DIR = path.join(HOME, ".codex", "relay-media");
 const EXTENSIONS = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" };
 
+const MIME_FOR = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+
+function dataUrlFor(file) {
+  try {
+    const extension = path.extname(file).slice(1).toLowerCase();
+    const mime = MIME_FOR[extension] ?? "image/png";
+    return `data:${mime};base64,${fs.readFileSync(file).toString("base64")}`;
+  } catch {
+    return null;
+  }
+}
+
 function saveImage(block) {
   const data = block?.source?.data;
   if (block?.source?.type !== "base64" || !data) return null;
@@ -269,9 +280,14 @@ const responseItem = (payload) => ({ timestamp: stamp(), type: "response_item", 
 
 function userRecords(text, turn, images = []) {
   // Codex carries pasted screenshots as local_images beside the text, and as
-  // input_image parts in the message itself.
+  // input_image parts in the message itself. The part must be a data URI: the
+  // thread is replayed to the API, which rejects a file:// URL outright and
+  // fails every turn after it.
   const content = [{ type: "input_text", text }];
-  for (const file of images) content.push({ type: "input_image", image_url: pathToFileURL(file).href, detail: "auto" });
+  for (const file of images) {
+    const url = dataUrlFor(file);
+    if (url) content.push({ type: "input_image", image_url: url, detail: "auto" });
+  }
   return [
     eventMsg({ type: "task_started", turn_id: turn, started_at: Math.floor(Date.now() / 1000), model_context_window: null, collaboration_mode_kind: "default" }),
     eventMsg({ type: "user_message", message: text, local_images: images, local_audio: [], text_elements: [] }),
