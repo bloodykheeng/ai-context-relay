@@ -749,13 +749,22 @@ function pendingFromCodex(ctx) {
     // work waiting on a thread paired elsewhere, which is the usual case: you
     // use whichever Codex thread is open, not the one bookkeeping picked.
     const pairedAnywhere = Object.values(state.threads).find((t) => t.rollout === rollout);
-    const seen = reads[rollout]
-      ?? pairedAnywhere?.codexRecords
-      // Truly unseen: start at the end so a thread does not dump its history.
-      ?? countLines(rollout);
+    // A thread relay made already holds Claude's side, so start where it stopped.
+    // A thread Codex made itself is work Claude has never seen, and its history
+    // IS the point: a chat begun in Codex must arrive whole, not from now on.
+    const seen = reads[rollout] ?? pairedAnywhere?.codexRecords ?? 0;
     const { items, readTo } = readCodexItems(rollout, seen);
     marks[rollout] = readTo;
     for (const item of items) if (!cameFromClaude(item)) collected.push(item);
+  }
+
+  // A long thread arriving whole would swamp the conversation it is joining, so
+  // carry the recent end of it and say how much was left behind.
+  if (collected.length > MAX_ITEMS_PULLED) {
+    const dropped = collected.length - MAX_ITEMS_PULLED;
+    const recent = collected.slice(-MAX_ITEMS_PULLED);
+    recent.unshift({ kind: "assistant", text: `(${dropped} earlier turns not carried; open the thread in Codex to read them)` });
+    return { items: recent, marks };
   }
   return { items: collected, marks };
 }
@@ -908,6 +917,10 @@ const MIN_ITEMS_TO_PAIR = 6;
 // session in every project opens a thread for work you finished this morning.
 // An existing pair keeps syncing however long it has been quiet.
 const PAIR_WINDOW_MS = 30 * 60 * 1000;
+
+// A chat begun in Codex arrives whole. This bounds how much of a long one lands
+// in the conversation at once.
+const MAX_ITEMS_PULLED = 60;
 
 const recentlyTouched = (file) => Date.now() - fs.statSync(file).mtimeMs < ACTIVE_WINDOW_MS;
 
