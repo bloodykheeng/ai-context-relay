@@ -49,6 +49,7 @@ function parseArgs(argv) {
     else if (a === "--status") opts.status = true;
     else if (a === "--reset") opts.reset = true;
     else if (a === "--new") opts.fresh = true;
+    else if (a === "--hook") opts.hook = true;
     else if (a === "--install") opts.install = true;
     else if (a === "--uninstall") opts.uninstall = true;
     else if (a === "--no-thinking") opts.thinking = false;
@@ -747,6 +748,31 @@ async function sync(opts, quiet = false) {
   return up.thread;
 }
 
+// Runs before every prompt, so it does the least possible: read one session
+// file and print. It never pushes and never creates a thread, because pairing
+// can take minutes talking to the Codex app server and would stall typing.
+// Silence is the normal case; Claude Code only adds context when we print.
+function hookPull(opts) {
+  let ctx;
+  try {
+    ctx = resolvePair(opts);
+  } catch {
+    return; // no session for this directory yet
+  }
+  if (!ctx.state.threads[ctx.key]) return;
+
+  const { items, readTo } = pendingFromCodex(ctx);
+  if (items.length === 0) return;
+
+  markCodexRead(ctx, readTo);
+  const context = `${items.length} new turns happened in Codex since your last message. `
+    + `They are part of this same conversation, so take them as context:\n${renderFromCodex(items)}`;
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: context },
+    suppressOutput: true,
+  }));
+}
+
 function status() {
   const state = loadState();
   const rows = Object.entries(state.threads);
@@ -1009,6 +1035,7 @@ function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) return console.log(HELP);
   if (!["native", "text"].includes(opts.tools)) die("--tools takes native or text");
+  if (opts.hook) return hookPull(opts);
   if (opts.install) return install();
   if (opts.uninstall) return uninstall();
   if (opts.status) return status();
