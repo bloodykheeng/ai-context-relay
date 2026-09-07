@@ -515,7 +515,12 @@ const writeRecords = (file, records, append) =>
 function readCodexItems(file, fromRecord) {
   const items = [];
   const names = new Map();
-  for (const rec of readJsonl(file).slice(fromRecord)) {
+  const records = readJsonl(file);
+  // How far this read actually got. Counting the file again afterwards marks
+  // records consumed that were written while we were reading, and Codex writes
+  // a question and its answer milliseconds apart, so the answer vanishes.
+  const readTo = records.length;
+  for (const rec of records.slice(fromRecord)) {
     const p = rec.payload;
     if (!p) continue;
     if (rec.type === "event_msg" && p.type === "user_message" && p.message?.trim()) {
@@ -531,7 +536,7 @@ function readCodexItems(file, fromRecord) {
       items.push({ kind: "tool_result", name: names.get(p.call_id) ?? "tool", text });
     }
   }
-  return items;
+  return { items, readTo };
 }
 
 // ---------------------------------------------------- writing Claude's side
@@ -612,7 +617,7 @@ function codexThreadsFor(cwd, ours) {
 // Claude opens a session by reading its transcript, so starting one from a
 // Codex thread means writing that transcript rather than driving the CLI.
 function adoptFromCodex(cwd, rollout) {
-  const items = readCodexItems(rollout, 0);
+  const { items } = readCodexItems(rollout, 0);
   if (items.length === 0) return null;
 
   const sessionId = crypto.randomUUID();
@@ -776,7 +781,7 @@ function toClaude(ctx) {
   const prior = ctx.state.threads[ctx.key];
   if (!prior || !fs.existsSync(prior.rollout)) return { moved: 0 };
 
-  const items = readCodexItems(prior.rollout, prior.codexRecords ?? 0);
+  const { items, readTo } = readCodexItems(prior.rollout, prior.codexRecords ?? 0);
   if (items.length === 0) return { moved: 0 };
 
   // Never append to a transcript Claude is still writing to, or our records
@@ -786,7 +791,7 @@ function toClaude(ctx) {
   writeRecords(ctx.transcript, claudeRecords(items, claudeContext(ctx.transcript)), true);
   ctx.state.threads[ctx.key] = {
     ...prior,
-    codexRecords: countLines(prior.rollout),
+    codexRecords: readTo,
     // Our own records are skipped on read, but stepping past them keeps the
     // next pass from re-reading what we just wrote.
     claudeBytes: fs.statSync(ctx.transcript).size,
