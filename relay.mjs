@@ -789,6 +789,11 @@ function reset(opts) {
 // Anything untouched for a day is finished work, not a chat being switched.
 const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
+// A Codex thread per throwaway chat buries the list. Wait until a session is
+// actually a conversation before pairing it. An existing pair keeps syncing
+// however small it is, so nothing already carried is dropped.
+const MIN_ITEMS_TO_PAIR = 6;
+
 const recentlyTouched = (file) => Date.now() - fs.statSync(file).mtimeMs < ACTIVE_WINDOW_MS;
 
 // Stamped after a pass so the next one can tell at a glance that nothing moved.
@@ -858,6 +863,7 @@ async function syncAll(opts) {
       if (!cwd) continue;
       try {
         const ctx = { cwd: normaliseCwd(cwd), transcript, key: transcript, state: loadState() };
+        if (readTurns(transcript, { thinking: false }).length < MIN_ITEMS_TO_PAIR) continue;
         const up = await toCodex(ctx, opts);
         if (up.created) say.push(`${path.basename(ctx.cwd)}: opened a Codex thread, "${up.thread.title}"`);
       } catch { /* a transcript mid-write is picked up next pass */ }
